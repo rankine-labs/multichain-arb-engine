@@ -84,25 +84,30 @@ def fmt(d, day):
     venue = (d.get("venue") or "?").upper()
     pool = short(d.get("pool", ""))
     if ev == "buy":
-        usd = d.get("usd_in") or d.get("usd")
+        usd = d.get("usd") or d.get("usd_in")
         size = f"${usd:.2f}" if isinstance(usd, (int, float)) else "$?"
         return f"🎯 <b>SNIPER LIVE BUY</b> {venue}\nsize {size} | pool {pool}\n{tx_links(d)}"
     if ev == "sell":
         real = d.get("real_net_usd")
         paper = d.get("paper_net_usd")
-        usd = d.get("usd_in") or 10.0
+        usd = d.get("_usd") or d.get("usd_in") or 10.0
         icon = "🟢" if isinstance(real, (int, float)) and real >= 0 else "🔴"
         r = f"${real:+.2f}" if isinstance(real, (int, float)) else "?"
         fill = d.get("fill_vs_quote_pct")
         lines = [
             f"{icon} <b>SNIPER LIVE SELL</b> {venue} ({d.get('reason', '?')}, {d.get('held_s', '?')}s)",
-            f"real {r}" + (f" ({real / usd * 100:+.1f}%)" if isinstance(real, (int, float)) and usd else ""),
+            f"real {r}" + (f" ({d['real_pct']:+.1f}%)" if isinstance(d.get("real_pct"), (int, float))
+                           else (f" ({real / usd * 100:+.1f}%)" if isinstance(real, (int, float)) and usd else "")),
         ]
-        if isinstance(paper, (int, float)):
-            lines.append(f"paper twin ${paper:+.2f}")
+        # Paper twin trades a different size ($100), so compare in %, not $.
+        ppct = d.get("paper_pct")
+        if isinstance(ppct, (int, float)):
+            lines.append(f"paper twin {ppct:+.1f}%")
         if isinstance(fill, (int, float)):
             lines.append(f"fill vs quote {fill:+.2f}%")
-        lines.append(f"live today ${day:+.2f}")
+        # Prefer the trader's own running total (exact, survives notifier restarts).
+        dr = d.get("day_realized_usd")
+        lines.append(f"live today ${(dr if isinstance(dr, (int, float)) else day):+.2f}")
         lines.append(tx_links(d))
         return "\n".join(x for x in lines if x)
     return f"⚠️ <b>SNIPER LIVE</b> {ev}: {json.dumps({k: v for k, v in d.items() if k not in ('txs',)})[:600]}"
@@ -154,7 +159,9 @@ def stats_text(title, sells):
     real = [s["real_net_usd"] for s in sells if isinstance(s.get("real_net_usd"), (int, float))]
     if not real:
         return f"📊 <b>{title}</b>\nno closed live trades"
-    paper = [s["paper_net_usd"] for s in sells if isinstance(s.get("paper_net_usd"), (int, float))]
+    # Paper twin at the LIVE size: paper % x live $ in (paper itself trades $100).
+    paper = [s["paper_pct"] / 100.0 * s.get("_usd", 10.0) for s in sells
+             if isinstance(s.get("paper_pct"), (int, float))]
     fills = [s["fill_vs_quote_pct"] for s in sells if isinstance(s.get("fill_vs_quote_pct"), (int, float))]
     wins = [x for x in real if x > 0]
     losses = [x for x in real if x <= 0]
@@ -181,9 +188,11 @@ def stats_text(title, sells):
 
 
 def all_sells(path, seen_at):
-    """Every sell row in the trade file, each with a timestamp attached.
-    Rows without their own timestamp use the time this notifier first saw them."""
-    out = []
+    """Every sell row in the trade file, each with a close time (_t) and live
+    size in USD (_usd) attached. Sell rows carry no clock time, so the close
+    time is the matching buy's pos.opened_unix + held_s. Rows that still have no
+    time use the moment this notifier first saw them."""
+    out, open_buy = [], {}
     try:
         with open(path) as f:
             for i, line in enumerate(f):
@@ -191,12 +200,22 @@ def all_sells(path, seen_at):
                     d = json.loads(line)
                 except ValueError:
                     continue
+                key = (d.get("token") or d.get("pool") or "").lower()
+                if d.get("event") == "buy":
+                    open_buy[key] = d
+                    continue
                 if d.get("event") != "sell":
                     continue
+                b = open_buy.pop(key, {})
+                opened = (b.get("pos") or {}).get("opened_unix")
                 t = row_time(d)
+                if t is None and isinstance(opened, (int, float)):
+                    t = opened + float(d.get("held_s") or 0)
                 if t is None:
                     t = seen_at.setdefault(i, time.time())
                 d["_t"] = t
+                if isinstance(b.get("usd"), (int, float)):
+                    d["_usd"] = b["usd"]
                 out.append(d)
     except OSError:
         pass
