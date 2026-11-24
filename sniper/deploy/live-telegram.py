@@ -30,6 +30,24 @@ import urllib.request
 EXPLORER = "https://robinhoodchain.blockscout.com/tx/"
 POLL_S = 2.0
 
+# ---------------------------------------------------------------------------
+# Low-balance alert
+#   Every BAL_EVERY_S the notifier reads the sniper wallet's plain ETH and
+#   WETH balances from the PUBLIC Robinhood Chain RPC (not our paid node, so
+#   it costs nothing against the Chainstack budget and needs no secret).
+#   If either one can no longer pay for one more trade plus the gas reserve,
+#   it posts a warning (at most once an hour per coin) and an all-clear when
+#   it recovers. V4 trades spend plain ETH, V3 trades spend WETH.
+# ---------------------------------------------------------------------------
+PUBLIC_RPC = os.environ.get("SNIPER_PUBLIC_RPC", "https://rpc.mainnet.chain.robinhood.com")
+WALLET = os.environ.get("SNIPER_WALLET", "0xA2462149e3b8894532622c65038905A6Eb0f540f")
+WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+GAS_RESERVE_ETH = 0.0005        # live keeps this much plain ETH for emergency sells
+DEFAULT_TRADE_ETH = 0.0060      # ~$10 at ~$1,700/ETH; replaced by the last real buy size
+BAL_EVERY_S = 300
+BAL_REPEAT_S = 3600
+
 
 def kv(path, key):
     """KEY=value from an env-style file, quotes stripped ('' if missing)."""
@@ -305,6 +323,69 @@ def worth_alert(line, last_sent, now):
     return True
 
 
+def rpc(method, params):
+    """One JSON-RPC call to the public node. Returns the result or None."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(PUBLIC_RPC, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read()).get("result")
+    except Exception:
+        return None
+
+
+def balances():
+    """(eth, weth, usdg) of the sniper wallet, or None if the node didn't answer."""
+    eth = rpc("eth_getBalance", [WALLET, "latest"])
+    data = "0x70a08231" + WALLET[2:].lower().rjust(64, "0")   # balanceOf(wallet)
+    weth = rpc("eth_call", [{"to": WETH, "data": data}, "latest"])
+    usdg = rpc("eth_call", [{"to": USDG, "data": data}, "latest"])
+    if eth is None or weth is None:
+        return None
+    return (int(eth, 16) / 1e18, int(weth, 16) / 1e18, int(usdg, 16) / 1e6 if usdg else 0.0)
+
+
+def trade_eth(trade_path):
+    """ETH needed for one trade: the size of the last real buy (base_in), else the default."""
+    last = None
+    try:
+        for line in open(trade_path):
+            if '"event":"buy"' in line or '"event": "buy"' in line:
+                last = line
+        if last:
+            d = json.loads(last)
+            b = (d.get("pos") or {}).get("base_in") or d.get("base_spent")
+            if b and d.get("base") in ("ETH", "WETH"):
+                return int(b) / 1e18
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_TRADE_ETH
+
+
+def balance_check(trade_path, state, now):
+    """Low-balance warnings. `state` remembers what's low and when we last said so."""
+    b = balances()
+    if b is None:
+        return []
+    eth, weth, usdg = b
+    need = trade_eth(trade_path)
+    state["last"] = b
+    msgs = []
+    for name, have, needed, venue in (("plain ETH", eth, need + GAS_RESERVE_ETH, "V4"),
+                                      ("WETH", weth, need, "V3")):
+        low = have < needed
+        was = state.get(name)
+        if low and (was is None or now - was >= BAL_REPEAT_S):
+            msgs.append(f"🪫 <b>SNIPER WALLET LOW: {name}</b>\n"
+                        f"Has {have:.4f}, needs {needed:.4f} for one more trade.\n"
+                        f"{venue} buys will be skipped until it's topped up.")
+            state[name] = now
+        elif not low and was is not None:
+            msgs.append(f"✅ SNIPER wallet {name} OK again ({have:.4f}).")
+            state.pop(name, None)
+    return msgs
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "paper-out/live1"
     tok, chat = creds()
@@ -325,6 +406,14 @@ def main():
              + "\n\n" + stats_text("Sniper: since going live", sells))
         print("summary sent", flush=True)
         return
+    if "--balances" in sys.argv:
+        b = balances()
+        print("balances (eth, weth, usdg):", b, "| one trade needs", round(trade_eth(trade_path), 5), "ETH", flush=True)
+        return
+    sigs = Tail(os.path.join(out, "signals.jsonl"))
+    bal_state = {}
+    last_bal = 0.0
+    cap_day = ""   # local day we last announced "daily loss limit reached"
     send(tok, chat, f"🎯 SNIPER live notifier started ({out}). Trades, hourly and {DAILY_HOUR} AM summaries will post here.")
     print(f"{time.strftime('%H:%M:%S')} watching {out}", flush=True)
     now = local_now()
@@ -349,6 +438,20 @@ def main():
         for line in log.lines():
             if worth_alert(line, last_sent, time.time()):
                 send(tok, chat, "⚠️ <b>SNIPER LIVE</b> " + line[:500].replace("<", "&lt;"))
+        # Live refused a buy because of the daily loss limit: say so once a day.
+        for line in sigs.lines():
+            if '"live_skip"' in line and "daily loss cap" in line:
+                dk = local_now().strftime("%Y-%m-%d")
+                if dk != cap_day:
+                    send(tok, chat, "🛑 <b>SNIPER LIVE stopped for the day</b>\n"
+                                    "Daily loss limit reached: one more losing trade could pass the cap, "
+                                    "so new buys are refused until the limit resets (7 PM Toronto).")
+                    cap_day = dk
+        # Wallet balances every few minutes.
+        if time.time() - last_bal >= BAL_EVERY_S:
+            last_bal = time.time()
+            for m in balance_check(trade_path, bal_state, last_bal):
+                send(tok, chat, m)
         # Hourly summary for the hour that just ended (only if it had trades).
         now = local_now()
         hour_key = now.strftime("%Y-%m-%d %H")
@@ -364,8 +467,10 @@ def main():
         if now.hour >= DAILY_HOUR and day_key != last_daily:
             sells = all_sells(trade_path, seen_at)
             cut = time.time() - 86400
+            b = bal_state.get("last") or balances()
+            wallet = (f"\n\n👛 Wallet: {b[0]:.4f} ETH, {b[1]:.4f} WETH, {b[2]:.2f} USDG" if b else "")
             send(tok, chat, stats_text("Sniper daily report (last 24 hours)", [s for s in sells if s["_t"] >= cut])
-                 + "\n\n" + stats_text("Sniper: since going live", sells))
+                 + "\n\n" + stats_text("Sniper: since going live", sells) + wallet)
             last_daily = day_key
         time.sleep(POLL_S)
 
