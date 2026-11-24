@@ -644,13 +644,14 @@ pub fn note_rush(hist: &mut VecDeque<u64>, block: u64, window: u64) {
 /// One hour in blocks (for the skip-first-rush window).
 pub const HOUR_BLOCKS: u64 = (3600.0 / BLOCK_SECS) as u64;
 
-pub const SKIP_REASONS: [&str; 13] = [
+pub const SKIP_REASONS: [&str; 14] = [
     "blocked token",
     "pool too young",
     "pool age unknown",
     "first rush",
     "blocked creator",
     "coin cooling off",
+    "stop-loss cooldown",
     "unsafe hook",
     "unknown v4 pool",
     "no sell history",
@@ -966,6 +967,13 @@ pub fn coin_cooling(hist: &[(u64, f64)], now: u64, window: Duration, max_loss: f
     sum < -max_loss
 }
 
+/// Stop-loss cooldown: true while `venue` is V3 and this coin's last
+/// stop-loss (unix seconds, main trades only) is less than `cool` ago.
+/// V4 (and V2) are never cooled; a zero `cool` turns it off.
+pub fn sl_cooling(venue: &Venue, last_sl: Option<u64>, now: u64, cool: Duration) -> bool {
+    matches!(venue, Venue::V3 { .. }) && !cool.is_zero() && last_sl.is_some_and(|t| now.saturating_sub(t) < cool.as_secs())
+}
+
 /// Unix time in seconds.
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -1056,6 +1064,12 @@ pub struct Config {
     /// (USD) within cut_window. 0 = off.
     pub cut_loss_usd: f64,
     pub cut_window: Duration,
+    /// Stop-loss cooldown (V3 only): after a coin stops us out, skip that
+    /// coin's V3 rushes for this long. Zero = off. Nov 24 test on 4 days of
+    /// paper (1,056 trades): V3 at 10 min went +$277 -> +$335 with a third of
+    /// the trades and no losing day (worst day -$162 -> +$6). On V4 it cost
+    /// money (+$1,788 -> +$1,345), so V4 is never cooled.
+    pub sl_cool_v3: Duration,
     /// At start, look back this many minutes for pool creations (pools
     /// older than this count as old enough).
     pub age_backfill_min: f64,
@@ -1184,6 +1198,7 @@ impl Config {
             min_prior_rushes: f("SNIPER_MIN_PRIOR_RUSHES", 0.0) as usize,
             cut_loss_usd: f("SNIPER_COIN_CUT_USD", 15.0),
             cut_window: Duration::from_secs_f64(f("SNIPER_COIN_CUT_HOURS", 6.0) * 3600.0),
+            sl_cool_v3: Duration::from_secs_f64(f("SNIPER_SL_COOL_SECS_V3", 0.0).max(0.0)),
             age_backfill_min: f("SNIPER_AGE_BACKFILL_MIN", 15.0),
             max_rise_pct: f("SNIPER_MAX_RISE_PCT", 8.0),
             tp: f("SNIPER_TP_PCT", 5.0) / 100.0,
@@ -1477,7 +1492,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     write(
         &mut f_meta,
         json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "sizing": "auto", "max_usd": cfg.max_usd, "max_positions": cfg.max_positions, "max_total_usd": cfg.max_total_usd, "sizes": cfg.sizes,
-               "min_sells": cfg.min_sells, "min_pool_age_s": cfg.min_pool_age_s, "coin_cut_usd": cfg.cut_loss_usd, "coin_cut_hours": cfg.cut_window.as_secs_f64() / 3600.0, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
+               "min_sells": cfg.min_sells, "min_pool_age_s": cfg.min_pool_age_s, "coin_cut_usd": cfg.cut_loss_usd, "coin_cut_hours": cfg.cut_window.as_secs_f64() / 3600.0, "sl_cool_v3_s": cfg.sl_cool_v3.as_secs_f64(), "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
                "rush_buys": cfg.rules.buys, "window_blocks": cfg.rules.window_blocks, "rise_pct": cfg.rules.rise_pct,
                "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks,
                "venues": venue_names, "v4_lookup": cfg.v4_lookup}),
@@ -1758,6 +1773,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut tally: BTreeMap<&'static str, VenueTally> = BTreeMap::new();
     // Coin cutoff: each coin's closed trades (when, net USD).
     let mut coin_hist = load_coin_history(&cfg.out, cfg.cut_window);
+    // Stop-loss cooldown: coin -> unix seconds of its last main-trade stop-loss.
+    let mut last_sl: HashMap<String, u64> = HashMap::new();
+    if !cfg.sl_cool_v3.is_zero() {
+        eprintln!("paper: stop-loss cooldown on: V3 coins skipped for {:.0} min after a stop-loss", cfg.sl_cool_v3.as_secs_f64() / 60.0);
+    }
     eprintln!("paper: coin cutoff: remembered {} coins' recent trades from earlier runs", coin_hist.len());
     // Put a token on the blocklist and save the file right away.
     let block = |bl: &mut Blocklist, token: &str, why: &str| {
@@ -2312,6 +2332,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         }
                         // Coin cooling-off history: every closed trade, young or main.
                         coin_hist.entry(p.info.token.to_ascii_lowercase()).or_default().push((unix_now(), net));
+                        if reason == "stop_loss" && p.young_age.is_none() {
+                            last_sl.insert(p.info.token.to_ascii_lowercase(), unix_now());
+                        }
                         let mut row = json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
                                    "held_s": p.opened.elapsed().as_secs_f64(), "reason": reason, "pool_move_pct": 100.0 * gain,
                                    "pre_flow": {"buys": p.pre_flow.0, "sells": p.pre_flow.1}, "early": p.early,
@@ -2562,6 +2585,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
             if cfg.cut_loss_usd > 0.0 && coin_hist.get(&info.token.to_ascii_lowercase()).is_some_and(|h| coin_cooling(h, unix_now(), cfg.cut_window, cfg.cut_loss_usd)) {
                 n_filtered += 1;
                 skip(&mut f_sig, format!("coin cooling off (lost over ${:.0} in {:.0}h)", cfg.cut_loss_usd, cfg.cut_window.as_secs_f64() / 3600.0))?;
+                continue;
+            }
+            // Stop-loss cooldown (V3 only, main trades only): don't re-buy a
+            // coin that just stopped us out; on choppy coins that re-entry
+            // was paying the chop over and over.
+            if young_age.get().is_none() && sl_cooling(&info.venue, last_sl.get(&info.token.to_ascii_lowercase()).copied(), unix_now(), cfg.sl_cool_v3) {
+                n_filtered += 1;
+                skip(&mut f_sig, format!("stop-loss cooldown ({:.0} min after a stop-loss)", cfg.sl_cool_v3.as_secs_f64() / 60.0))?;
                 continue;
             }
             if !sells.enough(&r.pool, cfg.min_sells) {
@@ -3385,6 +3416,22 @@ mod tests {
     }
 
     #[test]
+    fn stop_loss_cooldown_is_v3_only() {
+        let v3 = Venue::V3 { fee: 3000 };
+        let v2 = Venue::V2 { pair: "0x22".into(), token0: "0xaa".into() };
+        let ten = Duration::from_secs(600);
+        // V3: cooled for 10 min after the stop-loss, free after.
+        assert!(sl_cooling(&v3, Some(1_000), 1_000, ten));
+        assert!(sl_cooling(&v3, Some(1_000), 1_599, ten));
+        assert!(!sl_cooling(&v3, Some(1_000), 1_600, ten));
+        // No stop-loss on record, or the cooldown is off: never cooled.
+        assert!(!sl_cooling(&v3, None, 1_000, ten));
+        assert!(!sl_cooling(&v3, Some(1_000), 1_001, Duration::ZERO));
+        // Other venues are never cooled (V4 re-entries paid in the test).
+        assert!(!sl_cooling(&v2, Some(1_000), 1_001, ten));
+    }
+
+    #[test]
     fn coin_history_read_from_all_runs() {
         let root = std::env::temp_dir().join(format!("sniper-coinhist-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -3715,7 +3762,7 @@ mod tests {
         // only "busy" is left in the old busy/no-quote bucket
         assert!(r.contains("skipped (busy or no quote) 1 | blocked as unsafe 2"), "{r}");
         assert!(
-            r.contains("skips: blocked token 1 | pool too young 0 | pool age unknown 1 | first rush 0 | blocked creator 0 | coin cooling off 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
+            r.contains("skips: blocked token 1 | pool too young 0 | pool age unknown 1 | first rush 0 | blocked creator 0 | coin cooling off 0 | stop-loss cooldown 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
             "{r}"
         );
         let _ = fs::remove_dir_all(&dir);
