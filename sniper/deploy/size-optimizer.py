@@ -111,8 +111,8 @@ def kelly(rets):
 
 def replay(trades, start, rule, day_cap_frac=0.10):
     """rule(group, bankroll) -> $ size (0 = skip). Daily stop: no new trade
-    once the day's realised loss + this size would pass day_cap_frac x the
-    bankroll at the start of that day."""
+    once the day's realised loss reaches day_cap_frac x the bankroll at the
+    start of that day."""
     b, peak, mdd = start, start, 0.0
     day, day_start, day_pnl = None, start, 0.0
     worst_day, big_loss, n, rugs = 0.0, 0.0, 0, 0
@@ -125,7 +125,7 @@ def replay(trades, start, rule, day_cap_frac=0.10):
         s = rule(t["group"], b)
         if s <= 0 or s > b:
             continue
-        if -min(day_pnl, 0.0) + s > day_cap_frac * day_start:
+        if -day_pnl >= day_cap_frac * day_start:
             continue
         pnl = s * max(ret_at(t, s), -1.0)
         b += pnl
@@ -136,7 +136,7 @@ def replay(trades, start, rule, day_cap_frac=0.10):
         big_loss = min(big_loss, pnl)
         peak = max(peak, b)
         mdd = max(mdd, (peak - b) / peak)
-    worst_day = min(worst_day, day_pnl)
+    worst_day = min(worst_day, day_pnl, min(days.values(), default=0.0))
     return {"final": b, "profit": b - start, "mdd": mdd, "worst_day": worst_day,
             "big_loss": big_loss, "n": n, "rugs": rugs, "days": dict(days)}
 
@@ -161,16 +161,16 @@ def main():
         print(f"  {g:9s} {len(ts):5d} trades | rugs {sum(t['rug'] for t in ts):3d} | avg return "
               + " ".join(f"${s:.0f}:{100*avg[s]:+.2f}%" for s in SIZES) + f" | Kelly {100*K[g]:.1f}% of bankroll")
 
-    print("\n== Fixed sizes (daily stop at 10% of the day's starting bankroll) ==")
-    for main_s, young_s in ((10, 0), (10, 3), (25, 0), (25, 5), (50, 0), (50, 10), (100, 0)):
+    print("\n== Fixed sizes (daily stop: no new trades once the day is down 15% of bankroll) ==")
+    for main_s, young_s in ((5, 0), (5, 2), (10, 0), (10, 3), (15, 3), (20, 0), (20, 3), (25, 0), (25, 5), (50, 0), (50, 10)):
         rule = lambda g, b, m=main_s, y=young_s: y if g.startswith("young") else m
-        show(f"main ${main_s}, young V4 ${young_s}", replay(T, start, rule), start)
+        show(f"main ${main_s}, young V4 ${young_s}", replay(T, start, rule, 0.15), start)
 
     print("\n== % of current bankroll (compounding), capped by size and liquidity ==")
     best = None
-    for frac_k in (0.25, 0.5):
+    for frac_k in (0.1, 0.2, 0.25, 0.5):
         for cap in (25, 50, 100):
-            for day_cap in (0.10, 0.20):
+            for day_cap in (0.10, 0.15, 0.20):
                 def rule(g, b, fk=frac_k, c=cap):
                     s = min(fk * K[g] * b, c)
                     return s if s >= 2 else 0
