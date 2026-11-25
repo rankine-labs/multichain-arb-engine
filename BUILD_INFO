@@ -1,0 +1,5 @@
+source_commit=8a9beed7c46b5d53d219053104956af8df4f8150
+source_ref=sniper/phase1-leadtime-probe
+sniper_tree=314cf1f1cacf80860b4ea1589b766bf3c56872de
+built_at=2026-11-25T05:19:02Z
+workflow_run=https://github.com/rankine-labs/multichain-arb-engine/actions/runs/45552319725
