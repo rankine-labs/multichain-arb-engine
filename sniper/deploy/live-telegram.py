@@ -64,6 +64,10 @@ def creds():
     arb_env = kv("~/.sniper-cron.conf", "ARB_ENV")
     tok = kv(arb_env, "TELEGRAM_BOT_TOKEN") if arb_env else ""
     chat = kv(arb_env, "TELEGRAM_CHAT_ID") if arb_env else ""
+    # Sniper-only override: SNIPER_TG_CHAT in ~/.sniper-cron.conf sends the
+    # sniper's messages to another chat (e.g. the "Defi Bot Alerts" group)
+    # without touching the dex bot's own settings.
+    chat = kv("~/.sniper-cron.conf", "SNIPER_TG_CHAT") or chat
     if not tok or not chat:
         sys.exit("live-telegram: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not found in the arb .env")
     return tok, chat
