@@ -2761,6 +2761,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         // behind the chain (PR #249 lesson). Paper still trades it.
                         match lt.refuse(&info).or_else(|| lt.refuse_stale(&delay)) {
                             None => {
+                                // Speed log: rush block + when its logs were in hand.
+                                lt.signal = Some((r.block, t_logs));
                                 if let Err(e) = lt.buy(&r.pool, &info, usd_per_base, tokens, usd_in) {
                                     eprintln!("LIVE: buy {} not done ({e})", info.token);
                                 }

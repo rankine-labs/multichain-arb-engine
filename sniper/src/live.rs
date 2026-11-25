@@ -45,6 +45,19 @@ pub const CHAIN_ID: u64 = 4663;
 /// Uniswap SwapRouter02 on Robinhood Chain (from src/config/knownAddresses.ts,
 /// bytecode verified by the dex bot).
 pub const SWAP_ROUTER_02: &str = "0xcaf681a66d020601342297493863e78c959e5cb2";
+/// Free public Robinhood Chain node: used only for the background gas-price
+/// refresh (not our paid node, so it costs nothing against the budget).
+/// SNIPER_PUBLIC_RPC overrides.
+pub const PUBLIC_RPC: &str = "https://rpc.mainnet.chain.robinhood.com";
+
+/// How often the background thread refreshes the base fee, and how old a
+/// cached value may be before a send falls back to asking the node itself.
+pub const GAS_REFRESH: Duration = Duration::from_secs(2);
+pub const GAS_MAX_AGE: Duration = Duration::from_secs(10);
+/// How often the background thread pings the sequencer so the send
+/// connection never goes cold (dex bot PR #196: every 1 s).
+pub const SEND_WARM: Duration = Duration::from_secs(1);
+
 /// Where signed trades go: straight to Robinhood's sequencer, like the arb
 /// bot (PR #19: "sends to sequencer.mainnet.chain.robinhood.com"). Reads
 /// (nonce, gas, receipts) still use our normal node. SNIPER_SEND_RPC overrides.
@@ -506,6 +519,19 @@ pub struct Sender {
     pub send: Rpc,
     pub signer: Signer,
     next_nonce: Option<u64>,
+    /// Latest base fee from the background refresher, and when it was read
+    /// (speed: saves one node round trip before every send; dex bot #214).
+    base_fee: std::sync::Arc<std::sync::Mutex<Option<(U256, Instant)>>>,
+}
+
+/// Max fee from a base fee: 2x base fee + 1 (same rule everywhere).
+pub fn max_fee_from(base: U256) -> Result<u128, String> {
+    u128::try_from(base * U256::from(2u64) + U256::from(1u64)).map_err(|_| "base fee too big".to_string())
+}
+
+/// A cached base fee is usable only while fresh.
+pub fn fresh_base(cached: Option<(U256, Instant)>, now: Instant, max_age: Duration) -> Option<U256> {
+    cached.filter(|(_, t)| now.saturating_duration_since(*t) <= max_age).map(|(b, _)| b)
 }
 
 impl Sender {
@@ -517,7 +543,36 @@ impl Sender {
         if id != CHAIN_ID {
             return Err(format!("node is chain {id}, not Robinhood ({CHAIN_ID}): refusing to send"));
         }
-        Ok(Sender { rpc, send, signer, next_nonce: None })
+        Ok(Sender { rpc, send, signer, next_nonce: None, base_fee: Default::default() })
+    }
+
+    /// Start the speed helpers (live mode only), each on its own thread for
+    /// the life of the process:
+    ///   - gas: read the base fee every GAS_REFRESH from the free public
+    ///     node, so a send never waits for a gas lookup;
+    ///   - warm: ping the send endpoint every SEND_WARM so the connection to
+    ///     the sequencer is always open when a trade goes out.
+    ///
+    /// Neither one counts against the paid node budget.
+    pub fn start_background(&self, public_url: &str) {
+        let cache = self.base_fee.clone();
+        let public = Rpc::new(public_url);
+        std::thread::spawn(move || loop {
+            if let Ok(b) = public.call_uncounted("eth_getBlockByNumber", json!(["latest", false])) {
+                if let Some(base) = parse_u(&b["baseFeePerGas"]) {
+                    if let Ok(mut c) = cache.lock() {
+                        *c = Some((base, Instant::now()));
+                    }
+                }
+            }
+            std::thread::sleep(GAS_REFRESH);
+        });
+        let send = self.send.clone();
+        std::thread::spawn(move || loop {
+            // Any answer (even "method not available") keeps the connection open.
+            let _ = send.call_uncounted("eth_chainId", json!([]));
+            std::thread::sleep(SEND_WARM);
+        });
     }
 
     /// Next nonce: from the node the first time and after any doubt.
@@ -538,10 +593,16 @@ impl Sender {
 
     /// Max fee = 2x base fee + 1, tip 0 (Robinhood is first come, first
     /// served: a tip buys nothing; same rule as the arb bot's sender).
+    /// Uses the background value when it is fresh (no round trip), else
+    /// asks the node like before.
     pub fn max_fee(&self) -> Result<u128, String> {
+        let cached = self.base_fee.lock().ok().and_then(|c| *c);
+        if let Some(base) = fresh_base(cached, Instant::now(), GAS_MAX_AGE) {
+            return max_fee_from(base);
+        }
         let b = self.rpc.call("eth_getBlockByNumber", json!(["latest", false]))?;
         let base = parse_u(&b["baseFeePerGas"]).ok_or("no base fee")?;
-        u128::try_from(base * U256::from(2u64) + U256::from(1u64)).map_err(|_| "base fee too big".to_string())
+        max_fee_from(base)
     }
 
     /// Sign and send a batch back to back (consecutive nonces, no waiting
@@ -780,6 +841,18 @@ pub fn dry_fire_usd(url: &str, pool: &str, usd: f64, slip_bps: u64) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gas_cache_used_only_while_fresh() {
+        let t0 = Instant::now();
+        let base = U256::from(20_000_000u64);
+        // Fresh: used. Older than the limit: ignored (send asks the node).
+        assert_eq!(fresh_base(Some((base, t0)), t0 + Duration::from_secs(3), GAS_MAX_AGE), Some(base));
+        assert_eq!(fresh_base(Some((base, t0)), t0 + Duration::from_secs(11), GAS_MAX_AGE), None);
+        assert_eq!(fresh_base(None, t0, GAS_MAX_AGE), None);
+        // Same fee rule as before: 2x base + 1.
+        assert_eq!(max_fee_from(base).unwrap(), 40_000_001);
+    }
 
     #[test]
     fn dry_fire_refuses_v4_pool_ids() {

@@ -44,6 +44,9 @@ pub fn count_calls(n: u64) {
 }
 
 /// Minimal JSON-RPC over HTTPS client (blocking, kept-alive, like arbsim's).
+/// Clones share the same connection pool (ureq Agent), so a background
+/// thread can keep a connection warm for the main thread.
+#[derive(Clone)]
 pub struct Rpc {
     url: String,
     agent: ureq::Agent,
@@ -56,8 +59,15 @@ impl Rpc {
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         count_calls(1);
+        self.call_uncounted(method, params)
+    }
+
+    /// Same as `call` but NOT counted against the paid node budget. Only for
+    /// endpoints that are not our paid node (the sequencer warm-up ping, the
+    /// free public node's gas price reads).
+    pub fn call_uncounted(&self, method: &str, params: Value) -> Result<Value, String> {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut resp = self.agent.post(&self.url).send_json(&body).map_err(|e| format!("{method}: {e}"))?;
         let v: Value = resp.body_mut().read_json().map_err(|e| format!("{method}: bad reply: {e}"))?;
         if let Some(err) = v.get("error") {

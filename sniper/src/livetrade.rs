@@ -67,7 +67,7 @@ use crate::venue::{Venue, VenueKind, NATIVE_ETH};
 use ruint::aliases::U256;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// WETH on Robinhood Chain.
 pub const WETH: &str = "0x0bd7d308f8e1639fab988df18a8011f41eacad73";
@@ -329,6 +329,13 @@ pub struct RunOut {
     pub gas_wei: U256,
     pub swap: SwapFate,
     pub error: Option<String>,
+    /// Speed log: ms to sign + hand the batch to the sequencer, ms from the
+    /// send until the swap's receipt was seen, and the block it landed in.
+    pub send_ms: f64,
+    pub land_ms: f64,
+    pub swap_block: Option<u64>,
+    /// The moment the batch had been handed to the sequencer.
+    pub sent_at: Option<Instant>,
 }
 
 impl RunOut {
@@ -350,6 +357,43 @@ pub struct LiveTrader {
     state_path: PathBuf,
     log_path: PathBuf,
     rpc: Rpc,
+    /// Speed log: the rush block and when the bot had its logs in hand, for
+    /// the next buy (set by the caller just before buy()).
+    pub signal: Option<(u64, Instant)>,
+}
+
+/// Plain ETH balance of `who` (free function so it can run on a read thread).
+fn eth_wei_of(rpc: &Rpc, who: &str) -> Result<U256, String> {
+    let r = rpc.call("eth_getBalance", json!([who, "latest"]))?;
+    let h = r.as_str().unwrap_or("0x0").trim_start_matches("0x");
+    U256::from_str_radix(if h.is_empty() { "0" } else { h }, 16).map_err(|e| e.to_string())
+}
+
+/// Live quote at the latest block (free function so it can run on a read thread).
+fn quote_with(rpc: &Rpc, v: &Venue, token_in: &str, token_out: &str, amount: U256) -> Result<U256, String> {
+    let call = |to: &str, data: &str| -> Result<Option<String>, String> {
+        let r = rpc.call("eth_call", json!([{"to": to, "data": data}, "latest"]))?;
+        Ok(r.as_str().map(str::to_string))
+    };
+    crate::paper::quote_via(&call, v, token_in, token_out, amount).map(|(out, _)| out)
+}
+
+/// Speed record for one live trade (all ms):
+///   pre_send            our reads + checks before sending
+///   send                signing + handing the batch to the sequencer
+///   land                send -> the swap's receipt seen (includes our 100 ms polling)
+///   blocks_after_rush   swap block - rush block (buys only)
+///   rush_to_send        logs in hand -> batch sent (buys only)
+pub fn timing_json(pre_send_ms: f64, r: &RunOut, signal: Option<(u64, Instant)>) -> Value {
+    let mut t = json!({"pre_send_ms": pre_send_ms.round(), "send_ms": r.send_ms.round(), "land_ms": r.land_ms.round(), "swap_block": r.swap_block});
+    if let Some((rush_block, seen)) = signal {
+        t["rush_block"] = json!(rush_block);
+        t["blocks_after_rush"] = json!(r.swap_block.map(|b| b.saturating_sub(rush_block)));
+        if let Some(sent) = r.sent_at {
+            t["rush_to_send_ms"] = json!((sent.saturating_duration_since(seen).as_secs_f64() * 1000.0).round());
+        }
+    }
+    t
 }
 
 fn now_unix() -> u64 {
@@ -364,6 +408,9 @@ impl LiveTrader {
         let cfg = LiveCfg::from_lookup(&|k| std::env::var(k).ok())?;
         let signer = Signer::from_file(&gate.key_file)?;
         let sender = Sender::new(Rpc::new(read_url), Rpc::new(&live::send_url_from_env()), signer)?;
+        // Speed helpers: background gas price + warm sequencer connection.
+        let public = std::env::var("SNIPER_PUBLIC_RPC").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| live::PUBLIC_RPC.to_string());
+        sender.start_background(&public);
         let ledger = Ledger::load(&gate.ledger, live::utc_day(SystemTime::now()))?;
         let hours = parse_hours(&std::env::var("SNIPER_LIVE_HOURS").unwrap_or_default())?;
         Ok(LiveTrader::assemble(sender, gate, ledger, hours, cfg, read_url, out))
@@ -374,7 +421,7 @@ impl LiveTrader {
     pub fn assemble(sender: Sender, gate: Gate, ledger: Ledger, hours: Option<(u32, u32)>, cfg: LiveCfg, read_url: &str, out: &Path) -> LiveTrader {
         let state_path = out.join("live_open.json");
         let open = std::fs::read_to_string(&state_path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| LivePos::from_json(&v));
-        LiveTrader { sender, gate, ledger, hours, open, halted: None, fails: 0, cfg, state_path, log_path: out.join("live_trades.jsonl"), rpc: Rpc::new(read_url) }
+        LiveTrader { sender, gate, ledger, hours, open, halted: None, fails: 0, cfg, state_path, log_path: out.join("live_trades.jsonl"), rpc: Rpc::new(read_url), signal: None }
     }
 
     pub fn address(&self) -> String {
@@ -382,9 +429,7 @@ impl LiveTrader {
     }
 
     fn eth_wei(&self) -> Result<U256, String> {
-        let r = self.rpc.call("eth_getBalance", json!([self.address(), "latest"]))?;
-        let h = r.as_str().unwrap_or("0x0").trim_start_matches("0x");
-        U256::from_str_radix(if h.is_empty() { "0" } else { h }, 16).map_err(|e| e.to_string())
+        eth_wei_of(&self.rpc, &self.address())
     }
 
     /// The wallet's balance of a base coin (native ETH read as ETH).
@@ -399,11 +444,7 @@ impl LiveTrader {
     /// A fresh quote at the latest block, the same way paper prices this
     /// venue (V3 QuoterV2, V4 V4Quoter, V2 reserves maths).
     fn quote(&self, v: &Venue, token_in: &str, token_out: &str, amount: U256) -> Result<U256, String> {
-        let call = |to: &str, data: &str| -> Result<Option<String>, String> {
-            let r = self.rpc.call("eth_call", json!([{"to": to, "data": data}, "latest"]))?;
-            Ok(r.as_str().map(str::to_string))
-        };
-        crate::paper::quote_via(&call, v, token_in, token_out, amount).map(|(out, _)| out)
+        quote_with(&self.rpc, v, token_in, token_out, amount)
     }
 
     fn log(&self, v: Value) {
@@ -438,9 +479,13 @@ impl LiveTrader {
     /// Send a batch (approvals then the swap, last) and wait for every
     /// receipt. Any doubt about the swap halts new buys (never double-send).
     fn run(&mut self, txs: &[LiveTx], what: &str) -> RunOut {
-        let mut out = RunOut { txs: Vec::new(), gas_eth: 0.0, gas_wei: U256::ZERO, swap: SwapFate::Failed, error: None };
+        let mut out = RunOut { txs: Vec::new(), gas_eth: 0.0, gas_wei: U256::ZERO, swap: SwapFate::Failed, error: None, send_ms: 0.0, land_ms: 0.0, swap_block: None, sent_at: None };
         let last = txs.len().saturating_sub(1);
-        let sent = match self.sender.send_txs(txs) {
+        let t_send = Instant::now();
+        let sent = self.sender.send_txs(txs);
+        out.send_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+        out.sent_at = Some(Instant::now());
+        let sent = match sent {
             Ok(s) => s,
             Err(e) => {
                 let e = format!("{what}: {e}");
@@ -454,8 +499,12 @@ impl LiveTrader {
         let mut swap = SwapFate::Failed;
         for (i, h) in sent.hashes.iter().take(sent.accepted).enumerate() {
             let fate = match self.sender.wait(h, RECEIPT_WAIT) {
-                Outcome::Ok { gas_used, gas_price, .. } => {
+                Outcome::Ok { gas_used, gas_price, block } => {
                     out.gas_wei += U256::from(gas_used) * gas_price;
+                    if i == last {
+                        out.land_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+                        out.swap_block = Some(block);
+                    }
                     SwapFate::Done
                 }
                 Outcome::Reverted { gas_used, gas_price, .. } => {
@@ -526,7 +575,22 @@ impl LiveTrader {
         }
         let native = info.base_addr.eq_ignore_ascii_case(NATIVE_ETH);
         let reserve = U256::from((MIN_ETH_RESERVE * 1e18) as u128);
-        let eth = self.eth_wei()?;
+        let t_buy = Instant::now();
+        let signal = self.signal.take();
+        // Speed: every read the buy needs goes out at the same time (one
+        // node round trip instead of five in a row). Same reads, same checks.
+        let (eth_r, base_r, quote_r, tok_r) = {
+            let (rpc, sender, me) = (&self.rpc, &self.sender, self.address());
+            std::thread::scope(|s| {
+                let a = s.spawn(|| eth_wei_of(rpc, &me));
+                let b = s.spawn(|| if native { Ok(U256::ZERO) } else { sender.balance(&info.base_addr) });
+                let c = s.spawn(|| quote_with(rpc, &info.venue, &info.base_addr, &info.token, base_in));
+                let d = s.spawn(|| sender.balance(&info.token));
+                let j = |h: std::thread::ScopedJoinHandle<'_, Result<U256, String>>| h.join().unwrap_or_else(|_| Err("read thread failed".into()));
+                (j(a), j(b), j(c), j(d))
+            })
+        };
+        let eth = eth_r?;
         if eth < reserve {
             self.halted = Some("ETH for gas below reserve".into());
             return Err("ETH for gas below reserve".into());
@@ -537,18 +601,19 @@ impl LiveTrader {
                 return Err(format!("wallet has {:.6} ETH, needs {:.6} plus the {MIN_ETH_RESERVE} ETH gas reserve", show(eth), show(base_in)));
             }
         } else {
-            let have = self.sender.balance(&info.base_addr)?;
+            let have = base_r.clone()?;
             if have < base_in {
                 return Err(format!("wallet has {:.6} {b}, needs {:.6} {b} (live never swaps between base coins)", show(have), show(base_in), b = info.base));
             }
         }
-        let quote = self.quote(&info.venue, &info.base_addr, &info.token, base_in)?;
+        let quote = quote_r?;
         if quote.is_zero() {
             return Err("quote is zero".into());
         }
         let min = live::min_out(quote, SLIP_BPS);
-        let tok_before = self.sender.balance(&info.token)?;
-        let base_before = self.base_balance(&info.base_addr)?;
+        let tok_before = tok_r?;
+        let base_before = if native { eth } else { base_r? };
+        let pre_send_ms = t_buy.elapsed().as_secs_f64() * 1000.0;
         let now = now_unix();
         let txs = liveroute::trade_txs(&info.venue, &self.cfg.router, &self.address(), &info.base_addr, info.base, &info.token, base_in, min, now + DEADLINE_SECS, now)?;
         // Write the position down BEFORE sending, marked pending: whatever
@@ -594,7 +659,8 @@ impl LiveTrader {
                                 "paper_usd_in": paper_usd_in, "paper_tokens": paper_tokens.to_string(),
                                 "paper_tokens_per_usd": paper_per_usd, "live_tokens_per_usd": live_per_usd,
                                 "live_vs_paper_pct": (paper_per_usd > 0.0).then(|| (live_per_usd / paper_per_usd - 1.0) * 100.0),
-                                "warning": r.error, "pos": pos.to_json()}));
+                                "warning": r.error, "pos": pos.to_json(),
+                                "timing": timing_json(pre_send_ms, &r, signal)}));
                 eprintln!("LIVE: BUY {} [{venue}] ${:.2} of {} -> {} tokens (quote {}, paper {} for ${paper_usd_in:.0})", info.token, self.gate.max_trade_usd, info.base, tokens, quote, paper_tokens);
                 self.open = Some(pos);
                 self.save_open();
@@ -624,7 +690,18 @@ impl LiveTrader {
         let Some(mut pos) = self.open.clone() else { return Err("no live position".into()) };
         let dec = base_dec(&pos.base);
         let native = pos.native();
-        let tokens = self.sender.balance(&pos.token)?;
+        let t_sell = Instant::now();
+        // Speed: token balance and base balance read at the same time.
+        let (tok_r, base_r) = {
+            let (rpc, sender, me) = (&self.rpc, &self.sender, self.address());
+            let base_addr = pos.base_addr.clone();
+            std::thread::scope(|s| {
+                let a = s.spawn(|| sender.balance(&pos.token));
+                let b = s.spawn(|| if base_addr.eq_ignore_ascii_case(NATIVE_ETH) { eth_wei_of(rpc, &me) } else { sender.balance(&base_addr) });
+                (a.join().unwrap_or_else(|_| Err("read thread failed".into())), b.join().unwrap_or_else(|_| Err("read thread failed".into())))
+            })
+        };
+        let tokens = tok_r?;
         if tokens.is_zero() {
             return self.nothing_to_sell(pos, reason, usd_per_eth);
         }
@@ -632,7 +709,8 @@ impl LiveTrader {
         // No quote = sell at any price (we want out); logged as quote 0.
         let quote = self.quote(&pos.venue, &pos.token, &pos.base_addr, tokens).unwrap_or(U256::ZERO);
         let min = live::min_out(quote, slip);
-        let base_before = self.base_balance(&pos.base_addr)?;
+        let base_before = base_r?;
+        let pre_send_ms = t_sell.elapsed().as_secs_f64() * 1000.0;
         let now = now_unix();
         let txs = liveroute::trade_txs(&pos.venue, &self.cfg.router, &self.address(), &pos.token, "token", &pos.base_addr, tokens, min, now + DEADLINE_SECS, now)?;
         let what = if emergency { "emergency sell" } else { "sell" };
@@ -669,7 +747,8 @@ impl LiveTrader {
                         "real_net_usd": net, "real_pct": (usd_in > 0.0).then(|| net / usd_in * 100.0),
                         "paper_net_usd": paper_net, "paper_usd_in": pos.paper_usd_in,
                         "paper_pct": paper_net.filter(|_| pos.paper_usd_in > 0.0).map(|n| n / pos.paper_usd_in * 100.0),
-                        "held_s": now_unix().saturating_sub(pos.opened_unix), "day_realized_usd": self.ledger.realized_usd, "warning": r.error}));
+                        "held_s": now_unix().saturating_sub(pos.opened_unix), "day_realized_usd": self.ledger.realized_usd, "warning": r.error,
+                        "timing": timing_json(pre_send_ms, &r, None)}));
         eprintln!("LIVE: SELL {} [{}] ({reason}) real ${net:+.2} vs paper {:?} | today ${:+.2}", pos.token, pos.venue.kind().name(), paper_net, self.ledger.realized_usd);
         self.open = None;
         self.save_open();
@@ -752,6 +831,23 @@ pub fn wallet_status(read_url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_record_for_a_buy_and_a_sell() {
+        let seen = Instant::now();
+        let r = RunOut { txs: vec![], gas_eth: 0.0, gas_wei: U256::ZERO, swap: SwapFate::Done, error: None,
+                         send_ms: 4.6, land_ms: 310.2, swap_block: Some(1003), sent_at: Some(seen + Duration::from_millis(80)) };
+        let b = timing_json(35.4, &r, Some((1000, seen)));
+        assert_eq!(b["pre_send_ms"], 35.0);
+        assert_eq!(b["send_ms"], 5.0);
+        assert_eq!(b["land_ms"], 310.0);
+        assert_eq!(b["blocks_after_rush"], 3);
+        assert_eq!(b["rush_to_send_ms"], 80.0);
+        // A sell has no rush: just the send numbers.
+        let s = timing_json(20.0, &r, None);
+        assert!(s.get("blocks_after_rush").is_none() && s.get("rush_to_send_ms").is_none());
+        assert_eq!(s["swap_block"], 1003);
+    }
 
     #[test]
     fn hours_window_over_midnight() {
